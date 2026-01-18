@@ -25,7 +25,15 @@ Y_MARGIN = 5            # ROI 상하 여유
 # Tiling
 TILE = 512
 STRIDE = 256
-MIN_MASK_COVER = 0.70   # 타일 안에서 유효(마스크) 비율이 이보다 작으면 버림
+MIN_MASK_COVER = 0.90   # 타일 안에서 유효(마스크) 비율이 이보다 작으면 버림
+
+
+# 추가 필터 (타일 품질)
+BLACK_THR = 10            # grayscale < 10 이면 '검정'으로 간주
+MAX_BLACK_RATIO = 0.15    # ROI 내부 검정 비율이 15% 넘으면 버림
+MIN_TEXTURE_STD = 12.0    # ROI 내부 grayscale 표준편차가 이 값보다 작으면(텍스처 빈약) 버림
+MIN_VALID_PIXELS = 5000   # ROI 유효 픽셀이 너무 적으면 버림(안정성)
+
 
 # Optional: Stage1 seg model로 마스크 예측해서 쓰고 싶으면 True
 USE_PRED = False
@@ -238,6 +246,32 @@ def _unwrap_rubber_sheet(img: np.ndarray, mask: np.ndarray):
 
     return strip, strip_m
 
+def _tile_quality_stats(tile_bgr: np.ndarray, tile_mask01: np.ndarray):
+    # ROI(mask==1) 내부에서만 통계 계산
+    valid = (tile_mask01 > 0)
+    n_valid = int(valid.sum())
+    if n_valid == 0:
+        return 0, 1.0, 0.0  # valid_pixels, black_ratio, tex_std
+
+    g = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2GRAY)
+    gv = g[valid]
+
+    black_ratio = float((gv < BLACK_THR).mean())
+    tex_std = float(gv.std())
+    return n_valid, black_ratio, tex_std
+
+
+def _tile_quality_ok(tile_bgr: np.ndarray, tile_mask01: np.ndarray) -> bool:
+    valid_pixels, black_ratio, tex_std = _tile_quality_stats(tile_bgr, tile_mask01)
+
+    if valid_pixels < MIN_VALID_PIXELS:
+        return False
+    if black_ratio > MAX_BLACK_RATIO:
+        return False
+    if tex_std < MIN_TEXTURE_STD:
+        return False
+    return True
+
 
 
 def _tile_and_save(strip: np.ndarray, strip_m: np.ndarray, out_img_dir: Path, debug_dir: Path, stem: str, split: str):
@@ -264,6 +298,15 @@ def _tile_and_save(strip: np.ndarray, strip_m: np.ndarray, out_img_dir: Path, de
             if cover < MIN_MASK_COVER:
                 continue
 
+            # ✅ 0/1 마스크로 보장
+            tm01 = (tm > 0).astype(np.uint8)
+
+            # ✅ 타일 품질 필터(검정/텍스처)
+            if not _tile_quality_ok(tile, tm01):
+                continue
+
+            valid_pixels, black_ratio, tex_std = _tile_quality_stats(tile, tm01)
+
             out_name = f"{stem}_x{x0}_y{y0}.png"
             out_path = out_img_dir / out_name
             cv2.imwrite(str(out_path), tile)
@@ -276,6 +319,9 @@ def _tile_and_save(strip: np.ndarray, strip_m: np.ndarray, out_img_dir: Path, de
                 "y0": y0,
                 "tile_size": TILE,
                 "mask_cover": cover,
+                "valid_pixels": valid_pixels,
+                "black_ratio": black_ratio,
+                "tex_std": tex_std,
                 "strip_w": W,
                 "strip_h": H,
             })

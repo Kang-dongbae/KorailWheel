@@ -3,7 +3,7 @@ from pathlib import Path
 
 ROOT = Path(r"C:\Dev\KorailWheel")
 
-DATA = ROOT / "data"
+DATA = ROOT / "data" / "st1_roi"
 DATA_YAML = DATA / "data.yaml" 
 TEST_IMAGES = DATA / "test" / "images"
 TEST_LABELS = DATA / "test" / "labels"
