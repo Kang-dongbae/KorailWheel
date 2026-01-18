@@ -1,213 +1,359 @@
-import os, glob, csv, random, re
-from dataclasses import dataclass
-from typing import Tuple, List
-import numpy as np
-import cv2
+# preprocess.py
 from pathlib import Path
-import config as cfg
+import cv2
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
 
-# =========================
-# 1) Helpers
-# =========================
-def imread_rgb(path: str) -> np.ndarray:
-    bgr = cv2.imread(path, cv2.IMREAD_COLOR)
-    if bgr is None: raise FileNotFoundError(path)
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+from config import ROOT  # ROOT = Path(r"C:\Dev\KorailWheel") 같은 형태로 되어있다고 가정
 
-def imwrite_rgb(path: str, rgb: np.ndarray):
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(path, bgr)
+# -------------------------
+# Hyperparams (ONLY here)
+# -------------------------
+SPLITS = ["train", "valid", "test"]
 
-def resize_hw_fn(rgb: np.ndarray, hw: Tuple[int,int]) -> np.ndarray:
-    H, W = hw
-    return cv2.resize(rgb, (W, H), interpolation=cv2.INTER_AREA)
+DATA_DIR = ROOT / "data"                # 기존: data/train|valid|test/images, labels
+OUT_DIR  = DATA_DIR / "data_tiles"          # 새로 생성될 타일 데이터셋
+DBG_DIR  = DATA_DIR / "artifacts" / "debug_preprocess"
+DBG_DIR.mkdir(parents=True, exist_ok=True)
 
-def to_gray(rgb: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+# Unwrap (rubber-sheet) size
+UNWRAP_W = 768          # 너무 크게 잡으면(예: 2048) 텍스처가 퍼져서 불리함
+SMOOTH_WIN = 31         # 좌/우 경계선 스무딩(홀수 권장)
+Y_MARGIN = 5            # ROI 상하 여유
 
-def gaussian_1d_smooth(x: np.ndarray, k: int = 11) -> np.ndarray:
-    k = int(k)
-    if k < 3: return x
-    if k % 2 == 0: k += 1
-    xx = x.astype(np.float32)[None, :]
-    yy = cv2.GaussianBlur(xx, (k, 1), 0)
-    return yy[0]
+# Tiling
+TILE = 512
+STRIDE = 256
+MIN_MASK_COVER = 0.70   # 타일 안에서 유효(마스크) 비율이 이보다 작으면 버림
 
-def robust_polyfit(y: np.ndarray, x: np.ndarray, deg: int = 1, iters: int = 3, resid_thresh: float = 4.0) -> np.ndarray:
-    mask = np.isfinite(x)
-    yv, xv = y[mask], x[mask]
-    if len(xv) < deg + 2:
-        return np.array([0.0, float(np.nanmedian(xv))]) if len(xv) else np.array([0.0, 0.0])
+# Optional: Stage1 seg model로 마스크 예측해서 쓰고 싶으면 True
+USE_PRED = False
+SEG_WEIGHTS = ROOT / "runs" / "tread_seg_stage1" / "weights" / "best.pt"
+PRED_IMGSZ = 1024
+PRED_CONF = 0.25
+PRED_MAXDET = 5
+PRED_DEVICE = "0"
 
-    coef = np.polyfit(yv, xv, deg)
-    for _ in range(iters):
-        pred = np.polyval(coef, yv)
-        resid = np.abs(pred - xv)
-        inl = resid < resid_thresh
-        if inl.sum() < max(deg + 2, int(0.5 * len(xv))): break
-        coef = np.polyfit(yv[inl], xv[inl], deg)
-        yv, xv = yv[inl], xv[inl]
-    return coef
 
-# =========================
-# 2) Edge detection + Logic
-# =========================
-@dataclass
-class EdgeDebug:
-    left0: int; right0: int
-    valid_rate: float; mean_strength: float
-    width_mean: float; width_std: float
-    slope_left: float; slope_right: float
-    edge_ok: bool; reason: str
+# -------------------------
+# Utils
+# -------------------------
+def _img_list(folder: Path):
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    return sorted([p for p in folder.rglob("*") if p.suffix.lower() in exts])
 
-def detect_edges_per_row(rgb_rs: np.ndarray, win: int = 20, min_width: int = 30, grad_thr: float = 8.0):
-    gray = to_gray(rgb_rs)
-    gray = cv2.GaussianBlur(gray, (5,5), 0)
-    sobx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    g = np.abs(sobx)
-    H, W = g.shape
-    col_prof = gaussian_1d_smooth(g.mean(axis=0), k=21)
-    mid = W // 2
-    left0 = int(np.argmax(col_prof[:mid]))
-    right0 = int(np.argmax(col_prof[mid:]) + mid)
 
-    xL = np.full((H,), np.nan, dtype=np.float32)
-    xR = np.full((H,), np.nan, dtype=np.float32)
-    sL = np.zeros((H,), dtype=np.float32)
-    sR = np.zeros((H,), dtype=np.float32)
+def _read_polys_yolo_seg(label_path: Path):
+    # YOLO-seg line: cls x y w h x1 y1 x2 y2 ... (normalized polygon)
+    if not label_path.exists():
+        return []
+    txt = label_path.read_text(encoding="utf-8").strip()
+    if not txt:
+        return []
+    polys = []
+    for line in txt.splitlines():
+        p = line.strip().split()
+        coords = np.array(list(map(float, p[5:])), dtype=np.float32)
+        if coords.size >= 6:
+            polys.append(coords.reshape(-1, 2))
+    return polys
 
-    for y in range(H):
-        row = g[y]
-        l1, l2 = max(0, left0 - win), min(W, left0 + win + 1)
-        r1, r2 = max(0, right0 - win), min(W, right0 + win + 1)
-        li = int(np.argmax(row[l1:l2]) + l1)
-        ri = int(np.argmax(row[r1:r2]) + r1)
-        sl, sr = float(row[li]), float(row[ri])
-        if sl >= grad_thr and sr >= grad_thr and (ri - li) >= min_width:
-            xL[y], xR[y] = li, ri
-            sL[y], sR[y] = sl, sr
-    return xL, xR, sL, sR, left0, right0
 
-def warp_band_from_lines(rgb_rs: np.ndarray, coefL: np.ndarray, coefR: np.ndarray, band_w: int = 72, inner_margin: float = 2.0):
-    H, W = rgb_rs.shape[:2]
-    ys = np.arange(H, dtype=np.float32)
-    xL = np.clip(np.polyval(coefL, ys).astype(np.float32) + inner_margin, 0, W-2)
-    xR = np.clip(np.polyval(coefR, ys).astype(np.float32) - inner_margin, 1, W-1)
-    
-    bad = (xR - xL) < 10.0
-    if np.any(bad): xR[bad] = np.clip(xL[bad] + 10.0, 1, W-1)
+def _polys_to_mask(polys_norm, w, h):
+    m = np.zeros((h, w), dtype=np.uint8)
+    if not polys_norm:
+        return m
+    pts_list = []
+    for poly in polys_norm:
+        pts = poly.copy()
+        pts[:, 0] = np.clip(pts[:, 0] * w, 0, w - 1)
+        pts[:, 1] = np.clip(pts[:, 1] * h, 0, h - 1)
+        pts_list.append(pts.astype(np.int32))
+    cv2.fillPoly(m, pts_list, 1)
+    return m
 
-    xs = np.linspace(0, 1, band_w, dtype=np.float32)[None, :]
-    xmap = xL[:, None] + xs * (xR[:, None] - xL[:, None])
-    ymap = np.repeat(ys[:, None], band_w, axis=1)
-    
-    band = cv2.remap(rgb_rs, xmap, ymap, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    return band, xL, xR
 
-def compute_qc(xL, xR, sL, sR, left0, right0, coefL, coefR):
-    valid = np.isfinite(xL) & np.isfinite(xR)
-    vr = float(valid.mean()) if len(valid) else 0.0
-    if valid.sum() > 0:
-        widths = (xR[valid] - xL[valid]).astype(np.float32)
-        w_mean, w_std = float(widths.mean()), float(widths.std())
-        w_cv = float(w_std / (w_mean + 1e-6))
-        ms = float(((sL[valid] + sR[valid]) * 0.5).mean())
-    else:
-        w_mean, w_std, w_cv, ms = 0.0, 0.0, 1e9, 0.0
+def _smooth_1d(x: np.ndarray, win: int):
+    if win <= 1:
+        return x
+    if win % 2 == 0:
+        win += 1
+    pad = win // 2
+    xp = np.pad(x, (pad, pad), mode="edge")
+    k = np.ones(win, dtype=np.float32) / win
+    return np.convolve(xp, k, mode="valid")
 
-    slopeL = float(coefL[-2]) if len(coefL) >= 2 else 0.0
-    slopeR = float(coefR[-2]) if len(coefR) >= 2 else 0.0
 
-    edge_ok = True
-    reason = "OK"
-    if vr < 0.85: edge_ok, reason = False, f"valid_rate<{0.85}"
-    elif ms < 10.0: edge_ok, reason = False, f"mean_strength<{10.0}"
-    elif w_cv > 0.15: edge_ok, reason = False, f"width_cv>{0.15}" # notebook3 값 반영
-    elif (abs(slopeL) > 0.25) or (abs(slopeR) > 0.25): edge_ok, reason = False, "abs(slope)>0.25"
+def _mask_clean(mask: np.ndarray):
+    # 작은 구멍/잡음 정리
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    return mask
 
-    return EdgeDebug(left0, right0, vr, ms, w_mean, w_std, slopeL, slopeR, edge_ok, reason)
 
-def extract_band_v2(rgb: np.ndarray, resize_hw=(512,256), band_w=72):
-    rgb_rs = resize_hw_fn(rgb, resize_hw)
-    xL, xR, sL, sR, left0, right0 = detect_edges_per_row(rgb_rs, win=22, min_width=28, grad_thr=8.0)
-    H = rgb_rs.shape[0]
-    ys = np.arange(H, dtype=np.float32)
-    coefL = robust_polyfit(ys, xL, deg=1, resid_thresh=5.0)
-    coefR = robust_polyfit(ys, xR, deg=1, resid_thresh=5.0)
-    
-    qc = compute_qc(xL, xR, sL, sR, left0, right0, coefL, coefR)
-    band, xL_fit, xR_fit = warp_band_from_lines(rgb_rs, coefL, coefR, band_w=band_w)
-    
-    ov = rgb_rs.copy()
-    # Debug overlay (simplified)
-    for y in range(0, H, 2):
-        cv2.circle(ov, (int(xL_fit[y]), y), 1, (255,0,0), -1)
-        cv2.circle(ov, (int(xR_fit[y]), y), 1, (0,255,0), -1)
-        
-    return band, qc, ov
+def _band_bounds(mask: np.ndarray):
+    """
+    mask에서 각 y마다 좌/우 경계(xL, xR)를 뽑아 rubber-sheet 언랩에 씀
+    return: y0, y1, xL_arr, xR_arr (길이 = y1-y0+1)
+    """
+    ys = np.where(mask.sum(axis=1) > 0)[0]
+    if ys.size == 0:
+        return None
 
-# =========================
-# 3) Process Routines
-# =========================
-def process_split(split: str):
-    in_files = sorted(glob.glob(os.path.join(cfg.RAW_DATA_ROOT, split, "images", "*.jpg")))
-    print(f"[{split}] Input: {len(in_files)}")
-    
-    pass_dir = os.path.join(cfg.OUT_BAND_ROOT, split, "images")
-    rej_dir = os.path.join(cfg.OUT_BAND_ROOT, split, "reject", "images")
-    dbg_dir = os.path.join(cfg.OUT_BAND_ROOT, split, "debug")
-    cfg.ensure_dir(pass_dir); cfg.ensure_dir(rej_dir); cfg.ensure_dir(dbg_dir)
+    y0, y1 = int(ys.min()), int(ys.max())
 
-    qc_rows = []
-    saved_dbg = 0
-    for fp in in_files:
-        name = Path(fp).name
-        rgb = imread_rgb(fp)
-        band, qc, ov = extract_band_v2(rgb, resize_hw=cfg.RESIZE_HW, band_w=cfg.BAND_W)
-        
-        out_fp = os.path.join(pass_dir if qc.edge_ok else rej_dir, name)
-        imwrite_rgb(out_fp, band)
+    xL = []
+    xR = []
+    for y in range(y0, y1 + 1):
+        xs = np.where(mask[y] > 0)[0]
+        if xs.size == 0:
+            xL.append(-1)
+            xR.append(-1)
+        else:
+            xL.append(int(xs.min()))
+            xR.append(int(xs.max()))
 
-        if not qc.edge_ok and saved_dbg < 200:
-            rgb_rs = resize_hw_fn(rgb, cfg.RESIZE_HW)
-            H, W = rgb_rs.shape[:2]
-            canvas = np.zeros((H, W + W + cfg.BAND_W, 3), dtype=np.uint8)
-            canvas[:, :W] = rgb_rs; canvas[:, W:W+W] = ov; canvas[:, W+W:] = band
-            imwrite_rgb(os.path.join(dbg_dir, f"{Path(fp).stem}__{qc.reason}.png"), canvas)
-            saved_dbg += 1
-        
-        qc_rows.append({"file": name, "edge_ok": int(qc.edge_ok), "reason": qc.reason})
+    xL = np.array(xL, dtype=np.int32)
+    xR = np.array(xR, dtype=np.int32)
 
-    # Save CSV
-    csv_path = os.path.join(cfg.OUT_BAND_ROOT, split, "qc_metrics.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=qc_rows[0].keys())
-        w.writeheader()
-        w.writerows(qc_rows)
-    print(f"[{split}] QC Pass: {sum(r['edge_ok'] for r in qc_rows)}/{len(qc_rows)}")
+    # invalid row forward/back fill
+    valid = (xL >= 0) & (xR >= 0) & (xR > xL)
+    if not valid.any():
+        return None
 
-def process_tiling_split(split: str):
-    in_dir = os.path.join(cfg.OUT_BAND_ROOT, split, "images")
-    files = sorted(glob.glob(os.path.join(in_dir, "*.jpg")))
-    out_dir = os.path.join(cfg.OUT_TILE_ROOT, split, "images")
-    cfg.ensure_dir(out_dir)
-    print(f"[Tile {split}] Targets: {len(files)}")
+    # forward fill
+    last = None
+    for i in range(len(xL)):
+        if valid[i]:
+            last = (xL[i], xR[i])
+        elif last is not None:
+            xL[i], xR[i] = last
+    # backward fill
+    last = None
+    for i in range(len(xL) - 1, -1, -1):
+        if valid[i]:
+            last = (xL[i], xR[i])
+        elif last is not None:
+            xL[i], xR[i] = last
 
-    for fp in files:
-        band = imread_rgb(fp)
-        band = resize_hw_fn(band, (cfg.RESIZE_HW[0], cfg.BAND_W))
-        H, W = band.shape[:2]
-        k = 0
-        stem = Path(fp).stem
-        for y0 in range(0, H - cfg.TILE_H + 1, cfg.STRIDE):
-            y1 = y0 + cfg.TILE_H
-            tile = band[y0:y1, :, :]
-            imwrite_rgb(os.path.join(out_dir, f"{stem}__y{y0:04d}-{y1:04d}__k{k:02d}.jpg"), tile)
-            k += 1
+    # smooth boundaries
+    xL = _smooth_1d(xL.astype(np.float32), SMOOTH_WIN)
+    xR = _smooth_1d(xR.astype(np.float32), SMOOTH_WIN)
+
+    return y0, y1, xL, xR
+
+
+def _bounds_full(mask_slice: np.ndarray):
+    """
+    mask_slice(H,W) 전체 height(H)에 대해 각 row의 (xL, xR)을 만들고
+    빈 row는 forward/back fill로 채움. (길이 mismatch 방지)
+    """
+    H, W = mask_slice.shape
+    xL = np.full(H, -1, dtype=np.int32)
+    xR = np.full(H, -1, dtype=np.int32)
+
+    for i in range(H):
+        xs = np.where(mask_slice[i] > 0)[0]
+        if xs.size:
+            xL[i] = int(xs.min())
+            xR[i] = int(xs.max())
+
+    valid = (xL >= 0) & (xR > xL)
+    if not valid.any():
+        return None
+
+    # forward fill
+    last = None
+    for i in range(H):
+        if valid[i]:
+            last = (xL[i], xR[i])
+        elif last is not None:
+            xL[i], xR[i] = last
+
+    # backward fill
+    last = None
+    for i in range(H - 1, -1, -1):
+        if valid[i]:
+            last = (xL[i], xR[i])
+        elif last is not None:
+            xL[i], xR[i] = last
+
+    # smooth
+    xL = _smooth_1d(xL.astype(np.float32), SMOOTH_WIN)
+    xR = _smooth_1d(xR.astype(np.float32), SMOOTH_WIN)
+
+    return xL, xR
+
+
+def _unwrap_rubber_sheet(img: np.ndarray, mask: np.ndarray):
+    h, w = img.shape[:2]
+
+    bb = _band_bounds(mask)  # 여기서는 y0/y1만 쓰려고 호출
+    if bb is None:
+        return None
+    y0_old, y1_old, _, _ = bb
+
+    y0 = max(0, y0_old - Y_MARGIN)
+    y1 = min(h - 1, y1_old + Y_MARGIN)
+
+    mask_slice = mask[y0:y1 + 1, :]
+    H = mask_slice.shape[0]
+    ys = np.arange(y0, y1 + 1, dtype=np.float32)
+
+    bounds = _bounds_full(mask_slice)
+    if bounds is None:
+        return None
+    xL2, xR2 = bounds
+
+    map_x = np.zeros((H, UNWRAP_W), dtype=np.float32)
+    map_y = np.zeros((H, UNWRAP_W), dtype=np.float32)
+
+    for i in range(H):
+        xl = float(xL2[i])
+        xr = float(xR2[i])
+        if xr <= xl + 1:
+            xr = xl + 1.0
+
+        xs = np.linspace(xl, xr, UNWRAP_W, dtype=np.float32)
+        map_x[i, :] = np.clip(xs, 0, w - 1)
+        map_y[i, :] = ys[i]  # 중요: 픽셀 y좌표 그대로
+
+    strip = cv2.remap(
+        img, map_x, map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+
+    m = (mask.astype(np.float32) * 255.0)
+    strip_m = cv2.remap(
+        m, map_x, map_y,
+        interpolation=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    strip_m = (strip_m > 0).astype(np.uint8)
+
+    return strip, strip_m
+
+
+
+def _tile_and_save(strip: np.ndarray, strip_m: np.ndarray, out_img_dir: Path, debug_dir: Path, stem: str, split: str):
+    H, W = strip.shape[:2]
+    rows = []
+
+    # 디버그로 base 저장
+    cv2.imwrite(str(debug_dir / f"{stem}_base.png"), strip)
+
+    # 슬라이딩 타일
+    for y0 in range(0, max(1, H - TILE + 1), STRIDE):
+        for x0 in range(0, max(1, W - TILE + 1), STRIDE):
+            tile = strip[y0:y0 + TILE, x0:x0 + TILE]
+            tm   = strip_m[y0:y0 + TILE, x0:x0 + TILE]
+
+            # pad if needed (끝자락)
+            if tile.shape[0] != TILE or tile.shape[1] != TILE:
+                pad_h = TILE - tile.shape[0]
+                pad_w = TILE - tile.shape[1]
+                tile = cv2.copyMakeBorder(tile, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+                tm   = cv2.copyMakeBorder(tm,   0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
+
+            cover = float((tm > 0).mean())
+            if cover < MIN_MASK_COVER:
+                continue
+
+            out_name = f"{stem}_x{x0}_y{y0}.png"
+            out_path = out_img_dir / out_name
+            cv2.imwrite(str(out_path), tile)
+
+            rows.append({
+                "split": split,
+                "tile": str(out_path),
+                "src_stem": stem,
+                "x0": x0,
+                "y0": y0,
+                "tile_size": TILE,
+                "mask_cover": cover,
+                "strip_w": W,
+                "strip_h": H,
+            })
+
+    return rows
+
+
+# -------------------------
+# Optional: predict mask (for unlabeled images later)
+# -------------------------
+def _pred_mask_ultralytics(img_path: Path):
+    from ultralytics import YOLO
+    model = YOLO(str(SEG_WEIGHTS))
+    res = model.predict(
+        source=str(img_path),
+        task="segment",
+        imgsz=PRED_IMGSZ,
+        conf=PRED_CONF,
+        max_det=PRED_MAXDET,
+        device=PRED_DEVICE,
+        verbose=False,
+    )[0]
+    h, w = res.orig_shape
+    out = np.zeros((h, w), dtype=np.uint8)
+    if res.masks is None:
+        return out
+    # xy는 orig 좌표 폴리곤 리스트라 안전(이전 broadcast 에러 방지)
+    for poly in res.masks.xy:
+        pts = np.array(poly, dtype=np.int32)
+        if pts.shape[0] >= 3:
+            cv2.fillPoly(out, [pts], 1)
+    return out
+
+
+def main():
+    all_rows = []
+
+    for split in SPLITS:
+        img_dir = DATA_DIR / split / "images"
+        lab_dir = DATA_DIR / split / "labels"
+
+        out_img_dir = OUT_DIR / split / "images"
+        out_img_dir.mkdir(parents=True, exist_ok=True)
+
+        dbg_split = DBG_DIR / split
+        dbg_split.mkdir(parents=True, exist_ok=True)
+
+        imgs = _img_list(img_dir)
+        for img_path in tqdm(imgs, desc=f"preprocess:{split}"):
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+
+            h, w = img.shape[:2]
+
+            if USE_PRED:
+                mask = _pred_mask_ultralytics(img_path)
+            else:
+                label_path = lab_dir / f"{img_path.stem}.txt"
+                polys = _read_polys_yolo_seg(label_path)
+                mask = _polys_to_mask(polys, w, h)
+
+            mask = _mask_clean(mask)
+
+            out = _unwrap_rubber_sheet(img, mask)
+            if out is None:
+                continue
+            strip, strip_m = out
+
+            rows = _tile_and_save(strip, strip_m, out_img_dir, dbg_split, img_path.stem, split)
+            all_rows.extend(rows)
+
+    df = pd.DataFrame(all_rows)
+    out_csv = OUT_DIR / "tiles.csv"
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+    print("Saved:", out_csv)
+    print(df.groupby("split").size())
+
 
 if __name__ == "__main__":
-    for sp in ["train", "valid", "test"]:
-        process_split(sp)
-    for sp in ["train", "valid", "test"]:
-        process_tiling_split(sp)
-    print("Preprocessing Done.")
+    main()
