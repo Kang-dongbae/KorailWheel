@@ -1,87 +1,88 @@
 # preprocess.py
-'''
-전체 타일 생성(기본):
-python preprocess.py
+"""
+사용법
+- 전체(기본): python preprocess.py
+- tiles 모드 명시: python preprocess.py tiles
+- external만: python preprocess.py external_tiles
+- 특정 split만(호환): python preprocess.py train  / valid / test / external_test
+"""
 
-tiles 모드로 전체:
-python preprocess.py tiles
-
-특정 split만(기존 호환):
-python preprocess.py external_test
-
-external crop 디버그만:
-python preprocess.py external_crops
-
-external tiles만:
-python preprocess.py external_tiles
-
-calib crops(선택):
-python preprocess.py calib_crops
-'''
-# preprocess.py
 from pathlib import Path
+import sys
 import cv2
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-import sys
 
 from config import ROOT
 
-# -------------------------
-# Hyperparams (ONLY here)
-# -------------------------
-SPLITS = ["train", "valid", "test"]          # 기본
-ADD_EXTERNAL = True
-EXTERNAL_SPLIT = "external_test"            # ROOT/data/external_test/images, labels
+# =========================================================
+# INPUT/OUTPUT PATHS
+# =========================================================
+# 입력 데이터셋 (요청하신 경로 구조)
+#   ROOT/data/st1_roi/{train,valid,test,external_test}/{images,labels}
+DATA_DIR = ROOT / "data" / "st1_roi"
 
-DATA_DIR = ROOT / "data"
-OUT_DIR  = DATA_DIR / "data_tiles"
-DBG_DIR  = DATA_DIR / "artifacts" / "debug_preprocess"
+# 출력 타일 (기존 학습 코드 호환 유지)
+#   ROOT/data/data_tiles/{train,valid,test}/images
+#   ROOT/data/data_tiles/external_test/{normal,defect}/images
+OUT_DIR = ROOT / "data" / "data_tiles"
+
+DBG_DIR = ROOT / "data" / "artifacts" / "debug_preprocess"
 DBG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ----- MODE -----
-# tiles: train/valid/test 타일 생성 (+ external 있으면 external도 타일 분리 저장)
-# external_tiles: external_test만 타일 분리 저장
-# external_crops: external_test만 결함 중심 crop 생성(진단/디버그)
-# calib_crops: valid에서 normal crop 생성(추후 threshold 캘리브레이션용)
+# =========================================================
+# SPLIT / MODE
+# =========================================================
+SPLITS = ["train", "valid", "test"]
+ADD_EXTERNAL = True
+EXTERNAL_SPLIT = "external_test"
+
 MODE_DEFAULT = "tiles"
-MODES = {"tiles", "external_tiles", "external_crops", "calib_crops"}
+MODES = {"tiles", "external_tiles"}
 
-# External crop params (debug)
-CROP_SIZE = 512
-N_NORMAL_CROPS_PER_WHEEL = 30
-MIN_DEFECT_PIXELS_CROP = 150   # crop 내 defect 픽셀 최소치
-
-# Calib crops params (optional)
-CALIB_SPLIT = "valid"
-CALIB_N_PER_IMAGE = 30
-
-# Unwrap (rubber-sheet) size
+# =========================================================
+# UNWRAP (정규화) HYPERPARAMS
+# =========================================================
 UNWRAP_W = 768
 SMOOTH_WIN = 31
 Y_MARGIN = 5
 
-# Tiling
+# =========================================================
+# TILING HYPERPARAMS (in-domain)
+# =========================================================
 TILE = 512
 STRIDE = 256
 MIN_MASK_COVER = 0.90
 
-# 타일 품질
+# 품질 필터(in-domain) - 유지
 BLACK_THR = 10
 MAX_BLACK_RATIO = 0.15
 MIN_TEXTURE_STD = 12.0
 MIN_VALID_PIXELS = 5000
 
-# External defect tile labeling
-DEFECT_RATIO_THR = 0.02
-MIN_DEFECT_PIXELS = 300
+# =========================================================
+# TILING HYPERPARAMS (external 전용 설계)
+# =========================================================
+STRIDE_EXT = 128            # 외부는 더 촘촘히(커버리지↑)
+MIN_MASK_COVER_EXT = 0.85   # 외부 ROI 흔들림 대비 완화
 
-# 클래스 id (Roboflow class order에 맞춰야 함)
-TREAD_CLS  = 0
+# 외부 "정상 타일" 필터(너무 쓰레기만 제거) - 완화
+MAX_BLACK_RATIO_EXT = 0.40
+MIN_TEXTURE_STD_EXT = 6.0
+MIN_VALID_PIXELS_EXT = 3000
+
+# 외부 "결함 타일" 라벨링(미검출 방지 목적이면 작게)
+#   - GT 결함 픽셀 1개라도 있으면 defect로 잡고 싶으면 1
+MIN_DEFECT_PIXELS_EXT = 1
+
+# =========================================================
+# LABEL / CLASS
+# =========================================================
+TREAD_CLS = 0
 DEFECT_CLS = 1
 
-# Optional: Stage1 seg model로 tread 마스크 예측해서 쓰고 싶으면 True
+# Optional: ROI를 seg model로 예측해서 쓰고 싶으면 True
 USE_PRED = False
 SEG_WEIGHTS = ROOT / "runs" / "tread_seg_stage1" / "weights" / "best.pt"
 PRED_IMGSZ = 1024
@@ -89,14 +90,14 @@ PRED_CONF = 0.25
 PRED_MAXDET = 5
 PRED_DEVICE = "0"
 
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# -------------------------
-# Utils
-# -------------------------
+
+# =========================================================
+# UTILS
+# =========================================================
 def _img_list(folder: Path):
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    return sorted([p for p in folder.rglob("*") if p.suffix.lower() in exts])
-
+    return sorted([p for p in folder.rglob("*") if p.suffix.lower() in IMG_EXTS])
 
 def _read_yolo_instances(label_path: Path):
     """
@@ -132,7 +133,6 @@ def _read_yolo_instances(label_path: Path):
                 inst.append((cls, coords.reshape(-1, 2)))
     return inst
 
-
 def _polys_to_mask(polys_norm, w, h):
     m = np.zeros((h, w), dtype=np.uint8)
     if not polys_norm:
@@ -146,7 +146,6 @@ def _polys_to_mask(polys_norm, w, h):
     cv2.fillPoly(m, pts_list, 1)
     return m
 
-
 def _smooth_1d(x: np.ndarray, win: int):
     if win <= 1:
         return x
@@ -157,19 +156,16 @@ def _smooth_1d(x: np.ndarray, win: int):
     k = np.ones(win, dtype=np.float32) / win
     return np.convolve(xp, k, mode="valid")
 
-
 def _mask_clean_roi(mask: np.ndarray):
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
     return mask
 
-
 def _mask_clean_defect(mask: np.ndarray):
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
     return mask
-
 
 def _band_bounds(mask: np.ndarray):
     ys = np.where(mask.sum(axis=1) > 0)[0]
@@ -212,7 +208,6 @@ def _band_bounds(mask: np.ndarray):
     xR = _smooth_1d(xR.astype(np.float32), SMOOTH_WIN)
     return y0, y1, xL, xR
 
-
 def _bounds_full(mask_slice: np.ndarray):
     H, W = mask_slice.shape
     xL = np.full(H, -1, dtype=np.int32)
@@ -245,7 +240,6 @@ def _bounds_full(mask_slice: np.ndarray):
     xL = _smooth_1d(xL.astype(np.float32), SMOOTH_WIN)
     xR = _smooth_1d(xR.astype(np.float32), SMOOTH_WIN)
     return xL, xR
-
 
 def _unwrap_rubber_sheet(img: np.ndarray, roi_mask: np.ndarray, extra_masks=None):
     if extra_masks is None:
@@ -301,7 +295,6 @@ def _unwrap_rubber_sheet(img: np.ndarray, roi_mask: np.ndarray, extra_masks=None
     extra_strips = [_remap_mask(m) for m in extra_masks]
     return strip, strip_roi, extra_strips
 
-
 def _tile_quality_stats(tile_bgr: np.ndarray, tile_mask01: np.ndarray):
     valid = (tile_mask01 > 0)
     n_valid = int(valid.sum())
@@ -313,198 +306,25 @@ def _tile_quality_stats(tile_bgr: np.ndarray, tile_mask01: np.ndarray):
     tex_std = float(gv.std())
     return n_valid, black_ratio, tex_std
 
-
-def _tile_quality_ok(tile_bgr: np.ndarray, tile_mask01: np.ndarray) -> bool:
+def _tile_quality_ok(tile_bgr, tile_mask01, *, max_black_ratio, min_texture_std, min_valid_pixels):
     valid_pixels, black_ratio, tex_std = _tile_quality_stats(tile_bgr, tile_mask01)
-    if valid_pixels < MIN_VALID_PIXELS:
+    if valid_pixels < min_valid_pixels:
         return False
-    if black_ratio > MAX_BLACK_RATIO:
+    if black_ratio > max_black_ratio:
         return False
-    if tex_std < MIN_TEXTURE_STD:
+    if tex_std < min_texture_std:
         return False
     return True
 
-
-def _tile_and_save(strip, roi01, out_img_dir, debug_dir, stem, split, defect01=None, out_def_dir=None, out_norm_dir=None):
-    H, W = strip.shape[:2]
-    rows = []
-
-    cv2.imwrite(str(debug_dir / f"{stem}_base.png"), strip)
-
-    for y0 in range(0, max(1, H - TILE + 1), STRIDE):
-        for x0 in range(0, max(1, W - TILE + 1), STRIDE):
-            tile = strip[y0:y0 + TILE, x0:x0 + TILE]
-            tm   = roi01[y0:y0 + TILE, x0:x0 + TILE]
-
-            if tile.shape[0] != TILE or tile.shape[1] != TILE:
-                pad_h = TILE - tile.shape[0]
-                pad_w = TILE - tile.shape[1]
-                tile = cv2.copyMakeBorder(tile, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0))
-                tm   = cv2.copyMakeBorder(tm,   0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
-
-            cover = float((tm > 0).mean())
-            if cover < MIN_MASK_COVER:
-                continue
-
-            tm01 = (tm > 0).astype(np.uint8)
-            if not _tile_quality_ok(tile, tm01):
-                continue
-
-            valid_pixels, black_ratio, tex_std = _tile_quality_stats(tile, tm01)
-
-            is_defect = 0
-            defect_ratio = 0.0
-            defect_pixels = 0  # <-- 항상 정의
-
-            if defect01 is not None:
-                td = defect01[y0:y0 + TILE, x0:x0 + TILE]
-                if td.shape[0] != TILE or td.shape[1] != TILE:
-                    pad_h = TILE - td.shape[0]
-                    pad_w = TILE - td.shape[1]
-                    td = cv2.copyMakeBorder(td, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
-
-                roi_pixels = int(tm01.sum())
-                if roi_pixels > 0:
-                    defect_pixels = int(((td > 0) & (tm01 > 0)).sum())
-                    defect_ratio = float(defect_pixels / roi_pixels)
-                    is_defect = 1 if (defect_ratio >= DEFECT_RATIO_THR and defect_pixels >= MIN_DEFECT_PIXELS) else 0
-
-            out_name = f"{stem}_x{x0}_y{y0}.png"
-
-            # external_test이면 defect/normal 분리 저장
-            if out_def_dir is not None and out_norm_dir is not None:
-                out_path = (out_def_dir if is_defect else out_norm_dir) / out_name
-            else:
-                out_path = out_img_dir / out_name
-
-            cv2.imwrite(str(out_path), tile)
-
-            rows.append({
-                "split": split,
-                "tile": str(out_path),
-                "src_stem": stem,
-                "x0": x0, "y0": y0,
-                "tile_size": TILE,
-                "mask_cover": cover,
-                "valid_pixels": valid_pixels,
-                "black_ratio": black_ratio,
-                "tex_std": tex_std,
-                "strip_w": W, "strip_h": H,
-                "is_defect": int(is_defect),
-                "defect_ratio": float(defect_ratio),
-                "defect_pixels": int(defect_pixels),
-            })
-
-    return rows
-
-
-def _safe_crop(img, x0, y0, sz):
-    H, W = img.shape[:2]
-    x0 = int(np.clip(x0, 0, max(0, W - sz)))
-    y0 = int(np.clip(y0, 0, max(0, H - sz)))
-    return img[y0:y0+sz, x0:x0+sz], x0, y0
-
-
-def _crop_cover_ok(roi01_crop):
-    return float((roi01_crop > 0).mean()) >= MIN_MASK_COVER
-
-
-def _save_external_crops(strip, roi01, def01, out_def_dir, out_norm_dir, debug_dir, stem):
-    H, W = strip.shape[:2]
-    if def01 is None:
-        return 0, 0
-
-    n, lbl, stats, cents = cv2.connectedComponentsWithStats((def01 > 0).astype(np.uint8), connectivity=8)
-
-    # 1) 결함 crop 저장
-    def_count = 0
-    for i in range(1, n):
-        x, y, w, h, area = stats[i]
-        if area < MIN_DEFECT_PIXELS_CROP:
-            continue
-        cx, cy = cents[i]
-        x0 = int(cx - CROP_SIZE // 2)
-        y0 = int(cy - CROP_SIZE // 2)
-
-        crop, x0, y0 = _safe_crop(strip, x0, y0, CROP_SIZE)
-        roi_c, _, _ = _safe_crop(roi01, x0, y0, CROP_SIZE)
-        def_c, _, _ = _safe_crop(def01,  x0, y0, CROP_SIZE)
-
-        if not _crop_cover_ok(roi_c):
-            continue
-
-        defect_pixels = int(((def_c > 0) & (roi_c > 0)).sum())
-        if defect_pixels < MIN_DEFECT_PIXELS_CROP:
-            continue
-
-        # 품질 필터(ROI 기준)
-        if not _tile_quality_ok(crop, (roi_c > 0).astype(np.uint8)):
-            continue
-
-        name = f"{stem}_def_{def_count:03d}_x{x0}_y{y0}.png"
-        cv2.imwrite(str(out_def_dir / name), crop)
-        def_count += 1
-
-        vis = crop.copy()
-        cnts, _ = cv2.findContours((def_c > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(vis, cnts, -1, (0, 0, 255), 2)
-        cv2.imwrite(str(debug_dir / f"{stem}_defvis_{def_count:03d}.jpg"), vis)
-
-    # 2) 정상 crop 랜덤 샘플링
-    rng = np.random.default_rng(0)
-    norm_saved = 0
-    tries = 0
-    while norm_saved < N_NORMAL_CROPS_PER_WHEEL and tries < N_NORMAL_CROPS_PER_WHEEL * 50:
-        tries += 1
-        x0 = int(rng.integers(0, max(1, W - CROP_SIZE)))
-        y0 = int(rng.integers(0, max(1, H - CROP_SIZE)))
-
-        crop, x0, y0 = _safe_crop(strip, x0, y0, CROP_SIZE)
-        roi_c, _, _ = _safe_crop(roi01, x0, y0, CROP_SIZE)
-        def_c, _, _ = _safe_crop(def01,  x0, y0, CROP_SIZE)
-
-        if not _crop_cover_ok(roi_c):
-            continue
-
-        defect_pixels = int(((def_c > 0) & (roi_c > 0)).sum())
-        if defect_pixels > 0:
-            continue
-
-        if not _tile_quality_ok(crop, (roi_c > 0).astype(np.uint8)):
-            continue
-
-        name = f"{stem}_nor_{norm_saved:03d}_x{x0}_y{y0}.png"
-        cv2.imwrite(str(out_norm_dir / name), crop)
-        norm_saved += 1
-
-    return def_count, norm_saved
-
-
-def _save_calib_crops(strip, roi01, out_dir, debug_dir, stem):
-    H, W = strip.shape[:2]
-    rng = np.random.default_rng(0)
-
-    saved = 0
-    tries = 0
-    while saved < CALIB_N_PER_IMAGE and tries < CALIB_N_PER_IMAGE * 80:
-        tries += 1
-        x0 = int(rng.integers(0, max(1, W - CROP_SIZE)))
-        y0 = int(rng.integers(0, max(1, H - CROP_SIZE)))
-
-        crop, x0, y0 = _safe_crop(strip, x0, y0, CROP_SIZE)
-        roi_c, _, _ = _safe_crop(roi01, x0, y0, CROP_SIZE)
-
-        if not _crop_cover_ok(roi_c):
-            continue
-        if not _tile_quality_ok(crop, (roi_c > 0).astype(np.uint8)):
-            continue
-
-        name = f"{stem}_cal_{saved:03d}_x{x0}_y{y0}.png"
-        cv2.imwrite(str(out_dir / name), crop)
-        saved += 1
-
-    return saved
-
+def _sliding_starts(length: int, tile: int, stride: int):
+    """끝부분 누락 방지: 마지막 시작점(length-tile)을 강제 포함."""
+    if length <= tile:
+        return [0]
+    last = length - tile
+    starts = list(range(0, last + 1, stride))
+    if starts[-1] != last:
+        starts.append(last)
+    return sorted(set(starts))
 
 def _pred_mask_ultralytics(img_path: Path):
     from ultralytics import YOLO
@@ -528,19 +348,126 @@ def _pred_mask_ultralytics(img_path: Path):
             cv2.fillPoly(out, [pts], 1)
     return out
 
+def _tile_and_save(
+    strip, roi01,
+    *,
+    stem: str,
+    split: str,
+    debug_dir: Path,
+    out_img_dir: Path | None,
+    defect01=None,
+    out_def_dir: Path | None = None,
+    out_norm_dir: Path | None = None,
+    stride: int = STRIDE,
+    min_mask_cover: float = MIN_MASK_COVER,
+    is_external: bool = False,
+):
+    H, W = strip.shape[:2]
+    rows = []
+
+    # debug strip 저장(원하면 꺼도 됨)
+    cv2.imwrite(str(debug_dir / f"{stem}_base.png"), strip)
+
+    ys = _sliding_starts(H, TILE, stride)
+    xs = _sliding_starts(W, TILE, stride)
+
+    for y0 in ys:
+        for x0 in xs:
+            tile = strip[y0:y0 + TILE, x0:x0 + TILE]
+            tm   = roi01[y0:y0 + TILE, x0:x0 + TILE]
+
+            # pad (edge)
+            if tile.shape[0] != TILE or tile.shape[1] != TILE:
+                pad_h = TILE - tile.shape[0]
+                pad_w = TILE - tile.shape[1]
+                tile = cv2.copyMakeBorder(tile, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+                tm   = cv2.copyMakeBorder(tm,   0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
+
+            cover = float((tm > 0).mean())
+            if cover < min_mask_cover:
+                continue
+
+            tm01 = (tm > 0).astype(np.uint8)
+
+            # ---- external: 결함 여부를 먼저 계산해서 "결함 타일을 필터로 버리지 않기" ----
+            is_defect = 0
+            defect_pixels = 0
+            defect_ratio = 0.0
+
+            if defect01 is not None:
+                td = defect01[y0:y0 + TILE, x0:x0 + TILE]
+                if td.shape[0] != TILE or td.shape[1] != TILE:
+                    pad_h = TILE - td.shape[0]
+                    pad_w = TILE - td.shape[1]
+                    td = cv2.copyMakeBorder(td, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
+
+                roi_pixels = int(tm01.sum())
+                if roi_pixels > 0:
+                    defect_pixels = int(((td > 0) & (tm01 > 0)).sum())
+                    defect_ratio = float(defect_pixels / roi_pixels)
+                    if is_external:
+                        is_defect = 1 if defect_pixels >= MIN_DEFECT_PIXELS_EXT else 0
+
+            # ---- 품질 필터 ----
+            if not is_external:
+                # in-domain: 기존 필터 그대로
+                if not _tile_quality_ok(
+                    tile, tm01,
+                    max_black_ratio=MAX_BLACK_RATIO,
+                    min_texture_std=MIN_TEXTURE_STD,
+                    min_valid_pixels=MIN_VALID_PIXELS,
+                ):
+                    continue
+            else:
+                # external: 정상 타일만 필터(완화), 결함 타일은 최대한 유지
+                if is_defect == 0:
+                    if not _tile_quality_ok(
+                        tile, tm01,
+                        max_black_ratio=MAX_BLACK_RATIO_EXT,
+                        min_texture_std=MIN_TEXTURE_STD_EXT,
+                        min_valid_pixels=MIN_VALID_PIXELS_EXT,
+                    ):
+                        continue
+                else:
+                    # 결함 타일도 "완전 쓰레기"만 제거(선택)
+                    valid_pixels, black_ratio, _ = _tile_quality_stats(tile, tm01)
+                    if valid_pixels < 1000 or black_ratio > 0.85:
+                        continue
+
+            out_name = f"{stem}_x{x0}_y{y0}.png"
+
+            # external_test이면 defect/normal 분리 저장
+            if is_external and (out_def_dir is not None) and (out_norm_dir is not None):
+                out_path = (out_def_dir if is_defect else out_norm_dir) / out_name
+            else:
+                out_path = out_img_dir / out_name
+
+            cv2.imwrite(str(out_path), tile)
+
+            valid_pixels, black_ratio, tex_std = _tile_quality_stats(tile, tm01)
+
+            rows.append({
+                "split": split,
+                "tile": str(out_path),
+                "src_stem": stem,
+                "x0": x0, "y0": y0,
+                "tile_size": TILE,
+                "stride": stride,
+                "mask_cover": cover,
+                "valid_pixels": valid_pixels,
+                "black_ratio": black_ratio,
+                "tex_std": tex_std,
+                "strip_w": W, "strip_h": H,
+                "is_defect": int(is_defect),
+                "defect_ratio": float(defect_ratio),
+                "defect_pixels": int(defect_pixels),
+            })
+
+    return rows
 
 def _parse_mode_and_only_split():
-    """
-    호환 정책:
-      - python preprocess.py              -> MODE_DEFAULT
-      - python preprocess.py tiles        -> mode=tiles
-      - python preprocess.py external_crops -> mode=external_crops
-      - python preprocess.py external_test  -> (기존 호환) only_split=external_test, mode=MODE_DEFAULT
-      - python preprocess.py tiles test   -> mode=tiles, only_split=test
-    """
     mode = MODE_DEFAULT
     only = None
-
     if len(sys.argv) >= 2:
         a1 = sys.argv[1]
         if a1 in MODES:
@@ -548,9 +475,8 @@ def _parse_mode_and_only_split():
             if len(sys.argv) >= 3:
                 only = sys.argv[2]
         else:
-            # old style: first arg is a split
+            # old style: first arg is split name
             only = a1
-
     return mode, only
 
 
@@ -563,10 +489,8 @@ def main():
         splits = SPLITS.copy()
         if ADD_EXTERNAL:
             splits.append(EXTERNAL_SPLIT)
-    elif mode in ("external_tiles", "external_crops"):
+    elif mode == "external_tiles":
         splits = [EXTERNAL_SPLIT]
-    elif mode == "calib_crops":
-        splits = [CALIB_SPLIT]
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -592,11 +516,6 @@ def main():
             out_def.mkdir(parents=True, exist_ok=True)
             out_nor.mkdir(parents=True, exist_ok=True)
             out_img_dir = None
-        elif mode == "calib_crops":
-            out_img_dir = None
-            out_def = out_nor = None
-            calib_dir = OUT_DIR / "calib_crops" / "normal" / "images"
-            calib_dir.mkdir(parents=True, exist_ok=True)
         else:
             out_img_dir = OUT_DIR / split / "images"
             out_img_dir.mkdir(parents=True, exist_ok=True)
@@ -631,42 +550,35 @@ def main():
             strip, strip_roi, extras = out
             strip_def = extras[0] if extras else None
 
-            # ---- MODE branch ----
-            if split == EXTERNAL_SPLIT and mode == "external_crops":
-                _save_external_crops(strip, strip_roi, strip_def, out_def, out_nor, dbg_split, img_path.stem)
-                continue
-
-            if mode == "calib_crops":
-                _save_calib_crops(strip, strip_roi, calib_dir, dbg_split, img_path.stem)
-                continue
-
-            # tiles mode (in-domain + external_tiles)
+            # external 설계 반영: stride/cover/필터 정책만 다르게
             if split == EXTERNAL_SPLIT:
                 rows = _tile_and_save(
                     strip, strip_roi,
-                    out_img_dir=None,
-                    debug_dir=dbg_split,
                     stem=img_path.stem,
                     split=split,
+                    debug_dir=dbg_split,
+                    out_img_dir=None,
                     defect01=strip_def,
                     out_def_dir=out_def,
                     out_norm_dir=out_nor,
+                    stride=STRIDE_EXT,
+                    min_mask_cover=MIN_MASK_COVER_EXT,
+                    is_external=True,
                 )
             else:
                 rows = _tile_and_save(
                     strip, strip_roi,
-                    out_img_dir=out_img_dir,
-                    debug_dir=dbg_split,
                     stem=img_path.stem,
                     split=split,
+                    debug_dir=dbg_split,
+                    out_img_dir=out_img_dir,
                     defect01=None,
+                    stride=STRIDE,
+                    min_mask_cover=MIN_MASK_COVER,
+                    is_external=False,
                 )
-            all_rows.extend(rows)
 
-    # calib_crops / external_crops는 tiles.csv를 만들 필요가 없음
-    if mode in ("external_crops", "calib_crops"):
-        print("[DONE] crops mode finished. tiles.csv not generated in this mode.")
-        return
+            all_rows.extend(rows)
 
     df = pd.DataFrame(all_rows)
     out_csv = OUT_DIR / "tiles.csv"

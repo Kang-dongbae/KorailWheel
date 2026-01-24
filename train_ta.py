@@ -6,9 +6,12 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 from tqdm import tqdm
+
+
 
 # =========================================================
 # USER SETTINGS
@@ -50,6 +53,11 @@ PROJ_DIM = 256            # random projection dim (reduces memory + speeds KNN)
 VAL_PERCENTILE = 0.995    # threshold from val normal scores (top 0.5%)
 SEED = 0
 
+SCORE_MODE = "topk"   # "max" | "topk" | "pctl"
+TOPK = 10             # top-k mean
+PCTL = 99.5           # percentile
+
+SWEEP_FPR_TARGETS = [0.005, 0.01, 0.02, 0.05]  # external GOOD 기반 임계값 스윕
 
 
 # =========================================================
@@ -160,13 +168,11 @@ def coreset_subsample(bank_np, ratio=0.1, seed=0):
 # =========================================================
 # KNN distance (min squared L2)
 # =========================================================
-def knn_min_dist(query_np, bank_np, chunk=4096):
+def knn_min_dist(query_np, bank_np, faiss_index=None, chunk=4096):
     # query_np: [P,D], bank_np: [M,D] -> returns [P] min squared L2
-    if HAS_FAISS:
-        index = faiss.IndexFlatL2(bank_np.shape[1])
-        index.add(bank_np.astype(np.float32))
-        D, _ = index.search(query_np.astype(np.float32), 1)
-        return D.reshape(-1)  # already squared L2
+    if HAS_FAISS and (faiss_index is not None):
+        D, _ = faiss_index.search(query_np.astype(np.float32), 1)
+        return D.reshape(-1)  # faiss는 squared L2
 
     # torch fallback
     q = torch.from_numpy(query_np).to(DEVICE)
@@ -175,15 +181,22 @@ def knn_min_dist(query_np, bank_np, chunk=4096):
     with torch.no_grad():
         for i in range(0, q.shape[0], chunk):
             qq = q[i:i+chunk]
-            d = torch.cdist(qq, b)             # [c,M]
-            mins.append(d.min(dim=1).values)   # [c]
-    return (torch.cat(mins).cpu().numpy().astype(np.float32) ** 2)
+            d = torch.cdist(qq, b)             # L2
+            mins.append(d.min(dim=1).values)   # L2 min
+    return (torch.cat(mins).cpu().numpy().astype(np.float32) ** 2)  # squared L2로 맞춤
+
+
+def make_faiss_index(bank_np):
+    import faiss  # type: ignore
+    index = faiss.IndexFlatL2(bank_np.shape[1])
+    index.add(bank_np.astype(np.float32))
+    return index
 
 
 # =========================================================
 # SCORING
 # =========================================================
-def score_folder(feat_model, Wproj, bank_np, folder: Path, out_csv: Path):
+def score_folder(feat_model, Wproj, bank_np, folder: Path, out_csv: Path, faiss_index=None):
     ds = TileFolder(folder)
     dl = DataLoader(ds, batch_size=BATCH, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
@@ -193,13 +206,17 @@ def score_folder(feat_model, Wproj, bank_np, folder: Path, out_csv: Path):
         for x, paths in tqdm(dl, desc=f"score:{folder.name}"):
             x = x.to(DEVICE)
             feats = feat_model(x)
-            emb = embed_from_feats(feats)               # [B,P,D0]
+            emb = embed_from_feats(feats)  # [B,P,D0]
+
+            # (권장) L2 normalize: 외부 도메인에서 더 안정적
+            emb = F.normalize(emb, dim=-1)
+
             emb = (emb @ Wproj).cpu().numpy().astype(np.float32)  # [B,P,Dp]
 
             for i in range(emb.shape[0]):
-                q = emb[i]                              # [P,Dp]
-                d2 = knn_min_dist(q, bank_np)           # [P]
-                score = float(np.max(d2))               # image-level: max patch anomaly
+                q = emb[i]  # [P,Dp]
+                d2 = knn_min_dist(q, bank_np, faiss_index=faiss_index)  # [P]
+                score = calc_image_score(d2)
                 rows.append((paths[i], score))
 
     with open(out_csv, "w", encoding="utf-8") as f:
@@ -209,6 +226,32 @@ def score_folder(feat_model, Wproj, bank_np, folder: Path, out_csv: Path):
 
     scores = np.array([s for _, s in rows], dtype=np.float32)
     return scores
+
+def calc_image_score(d2_1d: np.ndarray) -> float:
+    # d2_1d: [P] patch distances (squared)
+    if SCORE_MODE == "max":
+        return float(np.max(d2_1d))
+    if SCORE_MODE == "pctl":
+        return float(np.percentile(d2_1d, PCTL))
+
+    # default: top-k mean
+    k = min(TOPK, d2_1d.size)
+    topk = np.partition(d2_1d, -k)[-k:]
+    return float(topk.mean())
+
+
+def threshold_sweep(scores_good, scores_def, fpr_targets, out_csv: Path):
+    rows = []
+    for fpr in fpr_targets:
+        thr = float(np.quantile(scores_good, 1.0 - fpr))  # external GOOD로만 thr 결정
+        rec = float((scores_def > thr).mean())
+        rows.append((fpr, thr, rec))
+
+    with open(out_csv, "w", encoding="utf-8") as f:
+        f.write("fpr_target,thr,recall\n")
+        for fpr, thr, rec in rows:
+            f.write(f"{fpr},{thr},{rec}\n")
+    return rows
 
 
 # =========================================================
@@ -299,6 +342,8 @@ def step1_train_val_test():
 
     # coreset
     bank = coreset_subsample(bank_proj, CORESET_RATIO, seed=SEED)
+    faiss_index = make_faiss_index(bank) if HAS_FAISS else None
+
 
     # save artifacts
     np.save(OUT_DIR / "bank.npy", bank)
@@ -324,12 +369,12 @@ def step1_train_val_test():
     (OUT_DIR / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     # score val -> threshold
-    val_scores = score_folder(feat_model, Wproj, bank, VAL_DIR, OUT_DIR / "val_scores.csv")
+    val_scores = score_folder(feat_model, Wproj, bank, VAL_DIR, OUT_DIR / "val_scores.csv", faiss_index=faiss_index)
     thr = float(np.quantile(val_scores, VAL_PERCENTILE))
     (OUT_DIR / "threshold.txt").write_text(f"{thr}\n", encoding="utf-8")
 
     # score test -> FPR
-    test_scores = score_folder(feat_model, Wproj, bank, TEST_DIR, OUT_DIR / "test_scores.csv")
+    test_scores = score_folder(feat_model, Wproj, bank, TEST_DIR, OUT_DIR / "test_scores.csv", faiss_index=faiss_index)
     fpr = float((test_scores > thr).mean())
 
     summary = (
@@ -357,6 +402,8 @@ def step2_external_eval():
     thr = float((OUT_DIR / "threshold.txt").read_text(encoding="utf-8").strip())
 
     feat_model = FeatureHook(BACKBONE, HOOK_LAYERS).to(DEVICE)
+    faiss_index = make_faiss_index(bank) if HAS_FAISS else None
+
 
     have_good = EXT_GOOD_DIR.exists() and len(list_images(EXT_GOOD_DIR)) > 0
     have_def  = EXT_DEFECT_DIR.exists() and len(list_images(EXT_DEFECT_DIR)) > 0
@@ -372,9 +419,9 @@ def step2_external_eval():
     scores_def  = None
 
     if have_good:
-        scores_good = score_folder(feat_model, Wproj, bank, EXT_GOOD_DIR, OUT_DIR / "external_good_scores.csv")
+        scores_good = score_folder(feat_model, Wproj, bank, EXT_GOOD_DIR, OUT_DIR / "external_good_scores.csv", faiss_index=faiss_index)
     if have_def:
-        scores_def = score_folder(feat_model, Wproj, bank, EXT_DEFECT_DIR, OUT_DIR / "external_defect_scores.csv")
+        scores_def  = score_folder(feat_model, Wproj, bank, EXT_DEFECT_DIR, OUT_DIR / "external_defect_scores.csv", faiss_index=faiss_index)
 
     lines = []
     lines.append("STEP2 external evaluation")
@@ -397,6 +444,11 @@ def step2_external_eval():
         ap  = average_precision(scores, labels)
         lines.append(f"AUROC={auc:.4f}")
         lines.append(f"AUPRC(AP)={ap:.4f}")
+        # external GOOD 기반 threshold sweep (defect 미사용으로 thr 결정)
+        sweep_csv = OUT_DIR / "external_thr_sweep.csv"
+        threshold_sweep(scores_good, scores_def, SWEEP_FPR_TARGETS, sweep_csv)
+        lines.append(f"Saved threshold sweep: {sweep_csv}")
+
 
     report = "\n".join(lines) + "\n"
     (OUT_DIR / "step2_external_report.txt").write_text(report, encoding="utf-8")
