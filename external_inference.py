@@ -19,10 +19,15 @@ WEIGHTS = RUNS_ROOT / "internal" / "train" / "weights" / "best.pt"
 # =========================
 # INFER SETTINGS
 # =========================
-IMG_SIZE = 512
-DEVICE   = "0"
-CONF     = 0.001
-MAX_DET  = 10
+IMG_SIZE = 512          # train_yolo.py와 동일하게
+RAW_CONF = 0.001        # 모델 호출은 낮게 (거의 다 뽑기)
+POST_CONF = 0.50        # 후처리 임계값(여기만 바꿔가며 실험)
+IOU     = 0.5
+MAX_DET = 100           # 10은 너무 작음(외부에서 희귀하게 뜨는 것까지 잘림)
+MIN_AREA_PX = 120        # 잡음(1~수픽셀) 제거용
+DEVICE   = "0"         # "cpu" or "0"
+
+
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -31,12 +36,13 @@ def _img_list(folder: Path):
     return sorted([p for p in folder.rglob("*") if p.suffix.lower() in IMG_EXTS])
 
 
-def _pred_union_mask_and_score(model: YOLO, img_path: Path):
+def _pred_best_mask_and_score(model: YOLO, img_path: Path):
     res = model.predict(
         source=str(img_path),
         task="segment",
         imgsz=IMG_SIZE,
-        conf=CONF,
+        conf=RAW_CONF,
+        iou=IOU,
         max_det=MAX_DET,
         device=DEVICE,
         retina_masks=True,
@@ -44,32 +50,39 @@ def _pred_union_mask_and_score(model: YOLO, img_path: Path):
     )[0]
 
     h, w = res.orig_shape
-    mask = np.zeros((h, w), dtype=np.uint8)
+    out = np.zeros((h, w), dtype=np.uint8)
 
-    score = 0.0
-    if res.boxes is not None and res.boxes.conf is not None and len(res.boxes.conf) > 0:
-        score = float(res.boxes.conf.max().item())
+    if res.masks is None or res.boxes is None or res.boxes.conf is None or len(res.boxes.conf) == 0:
+        return out, 0.0, 0, 0
 
-    if res.masks is None:
-        return mask, score
+    confs = res.boxes.conf.detach().cpu().numpy().astype(np.float32)
+    num_inst = int(len(confs))
+    best_conf = float(confs.max())
 
-    try:
-        md = res.masks.data
-        if md is not None:
-            md = md.cpu().numpy()
-            if md.ndim == 3 and md.shape[1] == h and md.shape[2] == w:
-                mask = (md > 0).any(axis=0).astype(np.uint8)
-                return mask, score
-    except Exception:
-        pass
+    md = res.masks.data
+    if md is None:
+        return out, best_conf, num_inst, 0
 
-    for poly in res.masks.xy:
-        if poly is None or len(poly) < 3:
+    md = md.detach().cpu().numpy()  # (N,H,W)
+    if not (md.ndim == 3 and md.shape[1] == h and md.shape[2] == w):
+        return out, best_conf, num_inst, 0
+
+    # conf/area 조건 통과한 것만 union
+    best_area = 0
+    for i, c in enumerate(confs):
+        if float(c) < POST_CONF:
             continue
-        pts = np.round(poly).astype(np.int32)
-        cv2.fillPoly(mask, [pts], 1)
+        m = (md[i] > 0).astype(np.uint8)
+        area = int(m.sum())
+        if area < MIN_AREA_PX:
+            continue
+        out = np.maximum(out, m)
+        best_area = max(best_area, area)
 
-    return mask, score
+    return out, best_conf, num_inst, best_area
+
+
+
 
 
 def _overlay_pred(img_bgr, pred01):
@@ -97,15 +110,18 @@ def infer_split(model: YOLO, cls_name: str):
             continue
         h, w = img.shape[:2]
 
-        pred, score = _pred_union_mask_and_score(model, img_path)
+        pred, score, num_inst, best_area = _pred_best_mask_and_score(model, img_path)
         pred_area_frac = float(pred.sum() / (h * w))
 
         rows.append({
             "image": str(img_path),
-            "score": score,
+            "score": score,                 # best conf (POST_CONF 전/후 판단에 사용)
+            "num_inst": int(num_inst),      # RAW_CONF에서 몇 개가 떴는지
+            "best_area": int(best_area),    # best 인스턴스 면적
             "pred_area_frac": pred_area_frac,
             "pred_pixels": int(pred.sum()),
         })
+
 
         vis = _overlay_pred(img, pred)
         cv2.imwrite(str(ov_dir / f"{img_path.stem}.jpg"), vis)

@@ -16,10 +16,10 @@ RUNS_ROOT  = Path(r"C:\Dev\KorailWheel\runs\synth_yolo")
 # =========================
 # YOLO SETTINGS
 # =========================
-PRETRAIN = "yolov8n-seg.pt"
+PRETRAIN = "yolov8m-seg.pt"
 IMG_SIZE = 512
-EPOCHS   = 80
-BATCH    = 32
+EPOCHS   = 100
+BATCH    = 16
 DEVICE   = "0"     # "cpu" or "0"
 CONF     = 0.25
 MAX_DET  = 10
@@ -56,7 +56,7 @@ def _read_yolo_seg_polys(label_path: Path):
     polys = []
     for line in txt.splitlines():
         p = line.strip().split()
-        if len(p) <= 5:
+        if len(p) <= 3:
             continue
         coords = np.array(list(map(float, p[5:])), dtype=np.float32)
         if coords.size >= 6:
@@ -117,12 +117,22 @@ def _pred_union_mask(model: YOLO, img_path: Path):
     except Exception:
         pass
 
+    # choose largest mask polygon only
+    best = None
+    best_area = 0.0
     for poly in res.masks.xy:
         if poly is None or len(poly) < 3:
             continue
         pts = np.round(poly).astype(np.int32)
-        cv2.fillPoly(out, [pts], 1)
+        area = cv2.contourArea(pts)
+        if area > best_area:
+            best_area = area
+            best = pts
+
+    if best is not None:
+        cv2.fillPoly(out, [best], 1)
     return out
+
 
 
 def _overlay(img_bgr, gt01=None, pred01=None):
@@ -149,7 +159,30 @@ def train() -> Path:
         project=str(RUNS_ROOT / "internal"),
         name="train",
         exist_ok=True,
+        patience=10,
+
+        # ---- add: small-defect friendly ----
+        mosaic=0.0,         # 0.0 말고 낮게
+        close_mosaic=0,    # 후반 10epoch는 mosaic 끄기
+        mixup=0.0,
+        copy_paste=0.0,
+
+        hsv_h=0.02,
+        hsv_s=0.45,
+        hsv_v=0.45,
+
+        degrees=5.0,
+        translate=0.10,
+        scale=0.50,
+        shear=0.0,
+        perspective=0.0,
+
+        fliplr=0.5,
+        flipud=0.0,
+        single_cls=True,
+
     )
+
     run_dir = Path(r.save_dir)
     best = run_dir / "weights" / "best.pt"
     print("best weights:", best)
@@ -194,13 +227,27 @@ def eval_internal(best_weights: Path):
     df = pd.DataFrame(rows)
     df.to_csv(out_dir / "test_metrics.csv", index=False, encoding="utf-8-sig")
 
+    # ---- add: split metrics (POS/NEG) ----
+    pos = df[df["gt_pixels"] > 0]
+    neg = df[df["gt_pixels"] == 0]
+
+    pos_dice = pos["dice"].mean() if len(pos) else 0.0
+    pos_iou  = pos["iou"].mean()  if len(pos) else 0.0
+    neg_fp_rate = (neg["pred_pixels"] > 0).mean() if len(neg) else 0.0
+
+    # (원하면) POS에서 recall proxy: pred가 1픽셀이라도 나오면 hit로 간주
+    pos_hit_rate = (pos["pred_pixels"] > 0).mean() if len(pos) else 0.0
+
     summary = (
         f"INTERNAL synth-test\n"
         f"count={len(df)}\n"
+        f"[POS only] n={len(pos)} dice={pos_dice:.4f} iou={pos_iou:.4f} hit_rate={pos_hit_rate:.3f}\n"
+        f"[NEG only] n={len(neg)} fp_rate(pred_pixels>0)={neg_fp_rate:.3f}\n"
         f"dice mean={df['dice'].mean():.4f} std={df['dice'].std(ddof=1):.4f}\n"
         f"iou  mean={df['iou'].mean():.4f} std={df['iou'].std(ddof=1):.4f}\n"
         f"saved: {out_dir}\n"
     )
+
     (out_dir / "summary.txt").write_text(summary, encoding="utf-8")
     print(summary)
 
