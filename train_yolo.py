@@ -17,8 +17,8 @@ RUNS_ROOT  = Path(r"C:\Dev\KorailWheel\runs\synth_yolo")
 # YOLO SETTINGS
 # =========================
 PRETRAIN = "yolov8m-seg.pt"
-IMG_SIZE = 512
-EPOCHS   = 100
+IMG_SIZE = 640
+EPOCHS   = 60
 BATCH    = 16
 DEVICE   = "0"     # "cpu" or "0"
 CONF     = 0.25
@@ -162,25 +162,15 @@ def train() -> Path:
         patience=10,
 
         # ---- add: small-defect friendly ----
-        mosaic=0.0,         # 0.0 말고 낮게
-        close_mosaic=0,    # 후반 10epoch는 mosaic 끄기
-        mixup=0.0,
-        copy_paste=0.0,
+        mosaic=0.0,       # 작은 결함 보호를 위해 끔
+        mask_ratio=1,     # 다운샘플링 없이 마스크 학습
+        overlap_mask=True,
 
-        hsv_h=0.02,
-        hsv_s=0.45,
-        hsv_v=0.45,
-
-        degrees=5.0,
-        translate=0.10,
-        scale=0.50,
-        shear=0.0,
-        perspective=0.0,
-
-        fliplr=0.5,
-        flipud=0.0,
-        single_cls=True,
-
+        degrees=15.0,     # 회전 ±15도 추가
+        translate=0.1,    # 평행 이동 10%
+        scale=0.5,        # 크기 변화 ±50%
+        fliplr=0.5,       # 좌우 반전 50%
+        flipud=0.5,       # 상하 반전 50% (휠은 위아래가 없으므로 유용함)
     )
 
     run_dir = Path(r.save_dir)

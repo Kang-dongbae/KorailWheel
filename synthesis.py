@@ -11,7 +11,7 @@ from config import ROOT
 # Paths
 # -------------------------
 TILES_DIR = ROOT / "data" / "data_tiles"
-PATCH_DIR = ROOT / "data" / "patch"
+PATCH_DIR = ROOT / "data" / "patch_real"
 OUT_DIR   = ROOT / "data" / "data_tiles_synth"
 
 # -------------------------
@@ -27,27 +27,27 @@ P_DEFECT_TEST  = 0.20
 MAX_PATCHES_PER_TILE = 2
 
 # [OPT] 외부 실사(박리/치핑 군집) 커버 + log-uniform 유지
-AREA_RATIO_MIN = 0.0007   # 0.05%
-AREA_RATIO_MAX = 0.015   # 4.0%
+AREA_RATIO_MIN = 0.001   # 0.05%
+AREA_RATIO_MAX = 0.02   # 4.0%
 
-SCALE_MIN = 0.25
+SCALE_MIN = 0.35
 SCALE_MAX = 1.00
 
 VALID_GRAY_THR = 12
 MIN_VALID_OVERLAP = 0.85  # [OPT] 0.95 -> 완화
 
 # feather
-FEATHER_PX = 10           # [OPT] 경계 부드럽게 (6 -> 10)
-MASK_ERODE = 1
+FEATHER_PX = 6           # [OPT] 경계 부드럽게 (6 -> 10)
+MASK_ERODE = 0
 
 # photometric match
 PHOTO_MATCH = True
 PHOTO_L_ONLY = True
-PHOTO_STRENGTH = 0.30    # [OPT] 결함 특징 죽이지 않게 약하게
+PHOTO_STRENGTH = 0.20    # [OPT] 결함 특징 죽이지 않게 약하게
 
 # [OPT] 결함 강도: 과도한 대비를 줄여 FP(얼룩) 억제
 DEFECT_STRENGTH_MIN = 0.90
-DEFECT_STRENGTH_MAX = 1.15
+DEFECT_STRENGTH_MAX = 1.10
 
 # seamlessClone (기본 OFF 유지)
 USE_SEAMLESS_CLONE = True
@@ -61,7 +61,7 @@ P_ACCEPT_LOW_GRAD = 0.55  # [OPT] grad 낮아도 55%는 허용
 
 # ---- Hard-negative (stain) normals ----
 # [OPT] 정상에서 밴딩/얼룩 다양성을 더 많이 보여줘서 FP 줄임
-P_STAIN_TRAIN = 0.25
+P_STAIN_TRAIN = 0.20
 P_STAIN_VALID = 0.15
 P_STAIN_TEST  = 0.15
 STAIN_MAX_BLOBS = 2
@@ -249,32 +249,47 @@ def _match_sharpness(patch_bgr: np.ndarray, roi_bgr: np.ndarray, alpha: np.ndarr
 
 
 def _random_transform_patch(rng, rgb, mask255, tile_size=512):
+    # 1. 기본 스케일
     ar = float(np.exp(rng.uniform(np.log(AREA_RATIO_MIN), np.log(AREA_RATIO_MAX))))
     tile_area = tile_size * tile_size
     mask_area = int((mask255 > 0).sum())
-    if mask_area <= 0:
-        return None
+    if mask_area <= 0: return None
+    s_base = (ar * tile_area / mask_area) ** 0.5
+    s_base = float(np.clip(s_base, SCALE_MIN, SCALE_MAX))
 
-    s = (ar * tile_area / mask_area) ** 0.5
-    s = float(np.clip(s, SCALE_MIN, SCALE_MAX))
-
+    # 2. [NEW] 비등방성 스케일링 (길쭉하게 찌그러트리기)
+    # 실제 결함은 구르는 방향으로 길쭉함 (Aspect Ratio 변형)
+    aspect = rng.uniform(0.5, 2.5) # 0.5(홀쭉) ~ 2.5(납작)
+    sx = s_base * np.sqrt(aspect)
+    sy = s_base / np.sqrt(aspect)
+    
     ph, pw = rgb.shape[:2]
-    nh = max(8, int(ph * s))
-    nw = max(8, int(pw * s))
+    nh = max(8, int(ph * sy))
+    nw = max(8, int(pw * sx))
+    
+    # 보간법: 축소 시 깨짐 방지를 위해 AREA 사용 권장이나 LINEAR도 무방
     rgb2  = cv2.resize(rgb,  (nw, nh), interpolation=cv2.INTER_LINEAR)
     mask2 = cv2.resize(mask255, (nw, nh), interpolation=cv2.INTER_NEAREST)
 
-    ang = float(rng.uniform(-5, 5))
+    # 3. 회전 및 뒤집기
+    ang = float(rng.uniform(-45, 45)) 
     M = cv2.getRotationMatrix2D((nw/2, nh/2), ang, 1.0)
     rgb3  = cv2.warpAffine(rgb2, M, (nw, nh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
     mask3 = cv2.warpAffine(mask2, M, (nw, nh), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
-    if rng.random() < 0.15:
+    if rng.random() < 0.5:
         rgb3 = cv2.flip(rgb3, 1)
         mask3 = cv2.flip(mask3, 1)
 
-    if (mask3 > 0).sum() < 200:
-        return None
+    # 4. [NEW] Motion Blur (선명도 죽이기)
+    # 합성 티(너무 쨍함)를 없애기 위해 50% 확률로 흐리게 만듦
+    if rng.random() < 0.5:
+        k = int(rng.choice([3, 5]))
+        rgb3 = cv2.GaussianBlur(rgb3, (k, k), 0)
+
+    # 유효성 체크
+    if (mask3 > 0).sum() < 30: return None 
+
     return rgb3, mask3
 
 

@@ -351,23 +351,12 @@ def _pred_mask_ultralytics(img_path: Path):
 def _tile_and_save(
     strip, roi01,
     *,
-    stem: str,
-    split: str,
-    debug_dir: Path,
-    out_img_dir: Path | None,
-    defect01=None,
-    out_def_dir: Path | None = None,
-    out_norm_dir: Path | None = None,
-    stride: int = STRIDE,
-    min_mask_cover: float = MIN_MASK_COVER,
-    is_external: bool = False,
+    stem: str, split: str, debug_dir: Path, out_img_dir: Path | None,
+    defect01=None, out_def_dir: Path | None = None, out_norm_dir: Path | None = None,
+    stride: int = STRIDE, min_mask_cover: float = MIN_MASK_COVER, is_external: bool = False,
 ):
     H, W = strip.shape[:2]
     rows = []
-
-    # debug strip 저장(원하면 꺼도 됨)
-    cv2.imwrite(str(debug_dir / f"{stem}_base.png"), strip)
-
     ys = _sliding_starts(H, TILE, stride)
     xs = _sliding_starts(W, TILE, stride)
 
@@ -376,91 +365,79 @@ def _tile_and_save(
             tile = strip[y0:y0 + TILE, x0:x0 + TILE]
             tm   = roi01[y0:y0 + TILE, x0:x0 + TILE]
 
-            # pad (edge)
+            # pad
             if tile.shape[0] != TILE or tile.shape[1] != TILE:
-                pad_h = TILE - tile.shape[0]
-                pad_w = TILE - tile.shape[1]
+                pad_h = TILE - tile.shape[0]; pad_w = TILE - tile.shape[1]
                 tile = cv2.copyMakeBorder(tile, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0))
                 tm   = cv2.copyMakeBorder(tm,   0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
 
             cover = float((tm > 0).mean())
-            if cover < min_mask_cover:
-                continue
-
+            if cover < min_mask_cover: continue
             tm01 = (tm > 0).astype(np.uint8)
 
-            # ---- external: 결함 여부를 먼저 계산해서 "결함 타일을 필터로 버리지 않기" ----
             is_defect = 0
             defect_pixels = 0
             defect_ratio = 0.0
+            
+            td_01 = None  # <--- ★ [수정됨] 변수 초기화 추가 ★
 
             if defect01 is not None:
                 td = defect01[y0:y0 + TILE, x0:x0 + TILE]
                 if td.shape[0] != TILE or td.shape[1] != TILE:
-                    pad_h = TILE - td.shape[0]
-                    pad_w = TILE - td.shape[1]
+                    pad_h = TILE - td.shape[0]; pad_w = TILE - td.shape[1]
                     td = cv2.copyMakeBorder(td, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
-
+                
                 roi_pixels = int(tm01.sum())
                 if roi_pixels > 0:
-                    defect_pixels = int(((td > 0) & (tm01 > 0)).sum())
+                    td_01 = (td > 0).astype(np.uint8)
+                    defect_pixels = int((td_01 & tm01).sum())
                     defect_ratio = float(defect_pixels / roi_pixels)
                     if is_external:
                         is_defect = 1 if defect_pixels >= MIN_DEFECT_PIXELS_EXT else 0
 
-            # ---- 품질 필터 ----
+            # 품질 필터
             if not is_external:
-                # in-domain: 기존 필터 그대로
-                if not _tile_quality_ok(
-                    tile, tm01,
-                    max_black_ratio=MAX_BLACK_RATIO,
-                    min_texture_std=MIN_TEXTURE_STD,
-                    min_valid_pixels=MIN_VALID_PIXELS,
-                ):
+                if not _tile_quality_ok(tile, tm01, max_black_ratio=MAX_BLACK_RATIO, min_texture_std=MIN_TEXTURE_STD, min_valid_pixels=MIN_VALID_PIXELS):
                     continue
             else:
-                # external: 정상 타일만 필터(완화), 결함 타일은 최대한 유지
                 if is_defect == 0:
-                    if not _tile_quality_ok(
-                        tile, tm01,
-                        max_black_ratio=MAX_BLACK_RATIO_EXT,
-                        min_texture_std=MIN_TEXTURE_STD_EXT,
-                        min_valid_pixels=MIN_VALID_PIXELS_EXT,
-                    ):
+                    if not _tile_quality_ok(tile, tm01, max_black_ratio=MAX_BLACK_RATIO_EXT, min_texture_std=MIN_TEXTURE_STD_EXT, min_valid_pixels=MIN_VALID_PIXELS_EXT):
                         continue
                 else:
-                    # 결함 타일도 "완전 쓰레기"만 제거(선택)
                     valid_pixels, black_ratio, _ = _tile_quality_stats(tile, tm01)
-                    if valid_pixels < 1000 or black_ratio > 0.85:
-                        continue
+                    if valid_pixels < 1000 or black_ratio > 0.85: continue
 
             out_name = f"{stem}_x{x0}_y{y0}.png"
 
-            # external_test이면 defect/normal 분리 저장
+            # 경로 결정
             if is_external and (out_def_dir is not None) and (out_norm_dir is not None):
-                out_path = (out_def_dir if is_defect else out_norm_dir) / out_name
+                base_dir = out_def_dir if is_defect else out_norm_dir
             else:
-                out_path = out_img_dir / out_name
-
+                base_dir = out_img_dir
+            
+            out_path = base_dir / out_name
             cv2.imwrite(str(out_path), tile)
 
-            valid_pixels, black_ratio, tex_std = _tile_quality_stats(tile, tm01)
+            # 라벨(.txt) 생성 및 저장
+            if is_external and is_defect and (td_01 is not None):
+                out_lbl_dir = base_dir.parent / "labels"
+                out_lbl_dir.mkdir(parents=True, exist_ok=True)
+                
+                out_lbl_path = out_lbl_dir / f"{out_path.stem}.txt"
+                
+                lines = _mask_to_yolo_lines(td_01, 0)
+                if lines:
+                    out_lbl_path.write_text("\n".join(lines), encoding="utf-8")
 
+            valid_pixels, black_ratio, tex_std = _tile_quality_stats(tile, tm01)
             rows.append({
                 "split": split,
                 "tile": str(out_path),
-                "src_stem": stem,
-                "x0": x0, "y0": y0,
-                "tile_size": TILE,
-                "stride": stride,
-                "mask_cover": cover,
+                "is_defect": int(is_defect),
+                "defect_pixels": int(defect_pixels),
                 "valid_pixels": valid_pixels,
                 "black_ratio": black_ratio,
                 "tex_std": tex_std,
-                "strip_w": W, "strip_h": H,
-                "is_defect": int(is_defect),
-                "defect_ratio": float(defect_ratio),
-                "defect_pixels": int(defect_pixels),
             })
 
     return rows
@@ -479,6 +456,26 @@ def _parse_mode_and_only_split():
             only = a1
     return mode, only
 
+def _mask_to_yolo_lines(mask01: np.ndarray, cls_id: int):
+    # 마스크에서 컨투어(테두리) 추출
+    cnts, _ = cv2.findContours(mask01, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    lines = []
+    for c in cnts:
+        if cv2.contourArea(c) < 5: continue # 너무 작은 점은 무시
+        
+        # 다각형 단순화 (점 개수 줄이기)
+        epsilon = 0.005 * cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, epsilon, True)
+        
+        # 정규화 (0~1 사이 값으로 변환)
+        points = approx.reshape(-1, 2).astype(np.float32)
+        points[:, 0] /= mask01.shape[1] # w
+        points[:, 1] /= mask01.shape[0] # h
+        
+        # YOLO 포맷 문자열 생성
+        coord_str = " ".join([f"{x:.6f} {y:.6f}" for x, y in points])
+        lines.append(f"{cls_id} {coord_str}")
+    return lines
 
 def main():
     mode, only = _parse_mode_and_only_split()
@@ -515,6 +512,8 @@ def main():
             out_nor = OUT_DIR / split / "normal" / "images"
             out_def.mkdir(parents=True, exist_ok=True)
             out_nor.mkdir(parents=True, exist_ok=True)
+            (OUT_DIR / split / "defect" / "labels").mkdir(parents=True, exist_ok=True)
+            (OUT_DIR / split / "normal" / "labels").mkdir(parents=True, exist_ok=True)
             out_img_dir = None
         else:
             out_img_dir = OUT_DIR / split / "images"

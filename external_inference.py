@@ -14,17 +14,17 @@ EXT_ROOT  = Path(r"C:\Dev\KorailWheel\data\data_tiles\external_test")
 RUNS_ROOT = Path(r"C:\Dev\KorailWheel\runs\synth_yolo")
 
 # weights produced by train_yolo.py
-WEIGHTS = RUNS_ROOT / "internal" / "train" / "weights" / "best.pt"
-
+#WEIGHTS = RUNS_ROOT / "internal" / "train" / "weights" / "best.pt"
+WEIGHTS = RUNS_ROOT / "finetune" / "final_simple" / "weights" / "best.pt"
 # =========================
 # INFER SETTINGS
 # =========================
-IMG_SIZE = 512          # train_yolo.py와 동일하게
+IMG_SIZE = 640          # train_yolo.py와 동일하게
 RAW_CONF = 0.001        # 모델 호출은 낮게 (거의 다 뽑기)
-POST_CONF = 0.50        # 후처리 임계값(여기만 바꿔가며 실험)
+POST_CONF = 0.005        # 후처리 임계값(여기만 바꿔가며 실험)
 IOU     = 0.5
 MAX_DET = 100           # 10은 너무 작음(외부에서 희귀하게 뜨는 것까지 잘림)
-MIN_AREA_PX = 120        # 잡음(1~수픽셀) 제거용
+MIN_AREA_PX = 5        # 잡음(1~수픽셀) 제거용
 DEVICE   = "0"         # "cpu" or "0"
 
 
@@ -47,6 +47,7 @@ def _pred_best_mask_and_score(model: YOLO, img_path: Path):
         device=DEVICE,
         retina_masks=True,
         verbose=False,
+        #augment=True,
     )[0]
 
     h, w = res.orig_shape
