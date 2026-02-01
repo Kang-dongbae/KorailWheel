@@ -1,0 +1,8 @@
+# auto-generated
+path: C:/Dev/KorailWheel/data/data_tiles_synth
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 1
+names: ["defect"]

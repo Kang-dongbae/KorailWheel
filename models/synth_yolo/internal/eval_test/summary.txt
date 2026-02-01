@@ -1,0 +1,7 @@
+INTERNAL synth-test
+count=1660
+[POS only] n=601 dice=0.0000 iou=0.0000 hit_rate=0.000
+[NEG only] n=1059 fp_rate(pred_pixels>0)=0.000
+dice mean=0.6380 std=0.4807
+iou  mean=0.6380 std=0.4807
+saved: C:\Dev\KorailWheel\runs\synth_yolo\internal\eval_test

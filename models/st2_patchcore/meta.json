@@ -1,0 +1,20 @@
+{
+  "step": 1,
+  "data_root": "C:\\Dev\\KorailWheel\\data\\data_tiles",
+  "train": "C:\\Dev\\KorailWheel\\data\\data_tiles\\train\\images",
+  "valid": "C:\\Dev\\KorailWheel\\data\\data_tiles\\valid\\images",
+  "test": "C:\\Dev\\KorailWheel\\data\\data_tiles\\test\\images",
+  "backbone": "wide_resnet50_2",
+  "hook_layers": [
+    "layer2",
+    "layer3"
+  ],
+  "img_size": 512,
+  "batch": 32,
+  "patches_per_image": 256,
+  "coreset_ratio": 0.1,
+  "proj_dim": 256,
+  "val_percentile": 0.995,
+  "seed": 0,
+  "has_faiss": false
+}

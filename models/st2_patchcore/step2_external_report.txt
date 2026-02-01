@@ -1,0 +1,7 @@
+STEP2 external evaluation
+threshold(from step1 val) = 10.546075
+external GOOD count=789, FPR@thr=0.0000
+external DEFECT count=159, Recall@thr=0.0000
+AUROC=0.6087
+AUPRC(AP)=0.2088
+Saved threshold sweep: C:\Dev\KorailWheel\runs\st2_patchcore\external_thr_sweep.csv

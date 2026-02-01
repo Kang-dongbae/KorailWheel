@@ -1,0 +1,6 @@
+STEP1 in-domain normal-only
+VAL threshold (q=0.995) = 10.546075
+TEST FPR (normal-only) = 0.0032
+VAL score: mean=10.118754, std=0.176895
+TEST score: mean=10.103069, std=0.165503
+Saved: C:\Dev\KorailWheel\runs\st2_patchcore
