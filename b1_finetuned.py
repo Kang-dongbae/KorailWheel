@@ -8,6 +8,8 @@ import torch
 import gc
 import re
 import math
+from collections import deque, defaultdict
+from functools import lru_cache
 
 # =========================
 # 설정
@@ -38,12 +40,12 @@ BATCH = 4
 WORKERS = 0
 AMP = False
 
-K_SHOTS = [1, 2, 3]   # 필요하면 [1,2,3,4,5]
+K_SHOTS = [1, 2, 3]
 N_REPEATS = 10
 
-# =========================
-# 유틸(위 B0와 동일)
-# =========================
+X_RE = re.compile(r"_x(\d+)")
+Y_RE = re.compile(r"_y(\d+)")
+
 def seed_all(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -53,15 +55,13 @@ def seed_all(seed: int):
 def get_wheel_id(filename: str) -> str:
     return filename.split('_')[0]
 
+@lru_cache(maxsize=20000)
 def parse_tile_coords(filename: str):
-    mx = re.search(r"_x(\d+)", filename)
-    my = re.search(r"_y(\d+)", filename)
+    mx = X_RE.search(filename)
+    my = Y_RE.search(filename)
     x = int(mx.group(1)) if mx else 0
     y = int(my.group(1)) if my else 0
     return x, y
-
-def calculate_distance(p1, p2):
-    return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
 
 def polygon_area_and_centroid(xs, ys):
     n = len(xs)
@@ -109,9 +109,7 @@ def parse_tile_representative_center(lbl_path: Path, label_format: str, defect_c
         area, cx, cy = polygon_area_and_centroid(xs, ys)
         if best is None or area > best[0]:
             best = (area, cx, cy)
-    if best is None:
-        return None
-    return (best[1], best[2])
+    return None if best is None else (best[1], best[2])
 
 def get_global_center_for_tile(img_path: Path, lbl_dir: Path,
                                label_format: str, defect_class_id: int,
@@ -127,27 +125,42 @@ def get_global_center_for_tile(img_path: Path, lbl_dir: Path,
     return (tile_x + cx * tile_size, tile_y + cy * tile_size)
 
 def cluster_points_bfs(points, eps):
-    n = len(points)
-    visited = [False] * n
+    # grid + deque + squared distance
+    if not points:
+        return []
+    eps2 = eps * eps
+    grid = defaultdict(list)
+    for idx, (_, (x, y)) in enumerate(points):
+        grid[(int(x // eps), int(y // eps))].append(idx)
+
+    visited = [False] * len(points)
     groups = []
-    for i in range(n):
+
+    for i in range(len(points)):
         if visited[i]:
             continue
-        queue = [i]
+        q = deque([i])
         visited[i] = True
-        member_imgs = [points[i][0]]
-        while queue:
-            cur = queue.pop(0)
-            cur_pt = points[cur][1]
-            for j in range(n):
-                if visited[j]:
-                    continue
-                if calculate_distance(cur_pt, points[j][1]) < eps:
-                    visited[j] = True
-                    queue.append(j)
-                    member_imgs.append(points[j][0])
-        uniq = list(dict.fromkeys(member_imgs))
-        groups.append(uniq)
+        member_imgs = []
+        while q:
+            cur = q.popleft()
+            img_path, (cx, cy) = points[cur]
+            member_imgs.append(img_path)
+
+            gx, gy = int(cx // eps), int(cy // eps)
+            for nx in (gx - 1, gx, gx + 1):
+                for ny in (gy - 1, gy, gy + 1):
+                    for j in grid.get((nx, ny), []):
+                        if visited[j]:
+                            continue
+                        _, (px, py) = points[j]
+                        dx = cx - px
+                        dy = cy - py
+                        if (dx * dx + dy * dy) < eps2:
+                            visited[j] = True
+                            q.append(j)
+
+        groups.append(list(dict.fromkeys(member_imgs)))
     return groups
 
 def group_tiles_by_label_clustering(img_files, lbl_dir: Path,
@@ -157,7 +170,7 @@ def group_tiles_by_label_clustering(img_files, lbl_dir: Path,
     for f in img_files:
         wheel_dict.setdefault(get_wheel_id(f.name), []).append(f)
     all_groups = []
-    for _, files in wheel_dict.items():
+    for files in wheel_dict.values():
         points = []
         for img_path in files:
             c = get_global_center_for_tile(img_path, lbl_dir, label_format, defect_class_id, tile_size)
@@ -178,13 +191,24 @@ def copy_files(file_list, dst_root: Path, split: str, lbl_source_dir: Path):
     dst_img = dst_root / split / "images"
     dst_lbl = dst_root / split / "labels"
     for src in file_list:
-        shutil.copy(src, dst_img / src.name)
+        shutil.copy2(src, dst_img / src.name)
         src_lbl = lbl_source_dir / f"{src.stem}.txt"
         dst_lbl_path = dst_lbl / f"{src.stem}.txt"
         if src_lbl.exists():
-            shutil.copy(src_lbl, dst_lbl_path)
+            shutil.copy2(src_lbl, dst_lbl_path)
         else:
             dst_lbl_path.write_text("", encoding="utf-8")
+
+def remove_files(file_list, dst_root: Path, split: str):
+    dst_img = dst_root / split / "images"
+    dst_lbl = dst_root / split / "labels"
+    for src in file_list:
+        p_img = dst_img / src.name
+        p_lbl = dst_lbl / f"{src.stem}.txt"
+        if p_img.exists():
+            p_img.unlink()
+        if p_lbl.exists():
+            p_lbl.unlink()
 
 def write_yaml(work_dir: Path):
     abs_path = work_dir.resolve().as_posix()
@@ -199,9 +223,6 @@ names: ["defect"]
         encoding="utf-8",
     )
 
-# =========================
-# B1: Random k-shot fine-tune
-# =========================
 def run_B1_random_kshot():
     defect_img_dir = SOURCE_DIR / "defect" / "images"
     defect_lbl_dir = SOURCE_DIR / "defect" / "labels"
@@ -222,13 +243,11 @@ def run_B1_random_kshot():
         print("Not enough defect groups. abort.")
         return
 
-    # BG spatial split
     hero_normals.sort(key=lambda p: parse_tile_coords(p.name)[1])
     mid = len(hero_normals) // 2
     bg_pool_train = hero_normals[:mid]
     bg_pool_test = hero_normals[mid:]
 
-    # fixed defect holdout
     seed_all(HERO_SPLIT_SEED)
     g2 = groups.copy()
     random.shuffle(g2)
@@ -236,7 +255,6 @@ def run_B1_random_kshot():
     train_pool_groups = g2[HERO_HOLDOUT_DEFECTS:]
     test_def_files = [f for g in test_groups for f in g]
 
-    # fixed BG (repeat마다 동일)
     seed_all(777)
     test_bg = random.sample(bg_pool_test, min(TEST_BG_N, len(bg_pool_test)))
     seed_all(778)
@@ -244,33 +262,48 @@ def run_B1_random_kshot():
 
     (RUNS_DIR / "B1_random").mkdir(parents=True, exist_ok=True)
 
+    # 고정 데이터는 1회만 복사
+    reset_dir(WORK_DIR)
+    copy_files(train_bg_fixed, WORK_DIR, "train", normal_lbl_dir)
+    copy_files(train_bg_fixed, WORK_DIR, "valid", normal_lbl_dir)
+    copy_files(test_def_files, WORK_DIR, "test", defect_lbl_dir)
+    copy_files(test_bg, WORK_DIR, "test", normal_lbl_dir)
+    write_yaml(WORK_DIR)
+
     results = []
+    prev_train_def_files = []
+
     for k in K_SHOTS:
         if k > len(train_pool_groups):
             continue
 
         for r in range(N_REPEATS):
-            gc.collect()
-            torch.cuda.empty_cache()
+            if (r % 3) == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
 
-            # 매 반복마다 랜덤 k-shot (nested 아님)
-            # test 그룹은 제외된 train_pool_groups에서만 샘플링
             pick_seed = 50000 + 1000 * k + r
             rng = random.Random(pick_seed)
             train_groups_k = rng.sample(train_pool_groups, k)
             train_def_files = [f for g in train_groups_k for f in g]
 
+            # 바뀐 결함 파일만 증분 반영
+            prev_set = set(prev_train_def_files)
+            cur_set = set(train_def_files)
+            to_remove = list(prev_set - cur_set)
+            to_add = list(cur_set - prev_set)
+
+            if to_remove:
+                remove_files(to_remove, WORK_DIR, "train")
+                remove_files(to_remove, WORK_DIR, "valid")
+            if to_add:
+                copy_files(to_add, WORK_DIR, "train", defect_lbl_dir)
+                copy_files(to_add, WORK_DIR, "valid", defect_lbl_dir)
+
+            prev_train_def_files = train_def_files
+
             train_seed = 9000 + 100 * k + r
             seed_all(train_seed)
-
-            reset_dir(WORK_DIR)
-            copy_files(train_def_files, WORK_DIR, "train", defect_lbl_dir)
-            copy_files(train_bg_fixed, WORK_DIR, "train", normal_lbl_dir)
-            copy_files(train_def_files, WORK_DIR, "valid", defect_lbl_dir)
-            copy_files(train_bg_fixed, WORK_DIR, "valid", normal_lbl_dir)
-            copy_files(test_def_files, WORK_DIR, "test", defect_lbl_dir)
-            copy_files(test_bg, WORK_DIR, "test", normal_lbl_dir)
-            write_yaml(WORK_DIR)
 
             model = YOLO(str(PRETRAINED_WEIGHTS))
             model.train(
@@ -288,7 +321,14 @@ def run_B1_random_kshot():
                 amp=AMP,
             )
 
-            m = model.val(data=str(WORK_DIR / "data.yaml"), split="test", imgsz=IMGSZ, batch=BATCH, verbose=False, workers=WORKERS)
+            m = model.val(
+                data=str(WORK_DIR / "data.yaml"),
+                split="test",
+                imgsz=IMGSZ,
+                batch=BATCH,
+                verbose=False,
+                workers=WORKERS,
+            )
             recall = float(m.box.r.mean()) if hasattr(m.box.r, "mean") else float(m.box.r)
             map50 = float(m.box.map50)
 
